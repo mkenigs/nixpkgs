@@ -1,6 +1,6 @@
-{ stdenv, fetchFromGitHub, python2Packages  }:
+{ stdenv, fetchFromGitHub, python3Packages  }:
 
-python2Packages.buildPythonApplication rec {
+python3Packages.buildPythonApplication rec {
   pname = "amazon-glacier-cmd-interface";
   version  = "2016-09-01";
 
@@ -16,7 +16,7 @@ python2Packages.buildPythonApplication rec {
     substituteInPlace setup.py --replace "'argparse'," ""
   '';
 
-  propagatedBuildInputs = with python2Packages; [
+  propagatedBuildInputs = with python3Packages; [
     boto
     dateutil
     prettytable
