@@ -1,4 +1,5 @@
 #! /somewhere/python3
+from abc import ABC, abstractmethod
 from contextlib import contextmanager, _GeneratorContextManager
 from queue import Queue, Empty
 from typing import Tuple, Any, Callable, Dict, Iterator, Optional, List, Iterable
@@ -390,7 +391,66 @@ class LegacyStartCommand(StartCommand):
             self._cmd += f" {qemuFlags}"
 
 
-class Machine:
+class Machine(ABC):
+    @abstractmethod
+    def execute(self, command: str) -> Tuple[int, str]:
+        pass
+
+    def succeed(self, *commands: str) -> str:
+        """Execute each command and check that it succeeds."""
+        output = ""
+        for command in commands:
+            with self.nested("must succeed: {}".format(command)):
+                (status, out) = self.execute(command)
+                if status != 0:
+                    self.log("output: {}".format(out))
+                    raise Exception(
+                        "command `{}` failed (exit code {})".format(command, status)
+                    )
+                output += out
+        return output
+
+    def fail(self, *commands: str) -> str:
+        """Execute each command and check that it fails."""
+        output = ""
+        for command in commands:
+            with self.nested("must fail: {}".format(command)):
+                (status, out) = self.execute(command)
+                if status == 0:
+                    raise Exception(
+                        "command `{}` unexpectedly succeeded".format(command)
+                    )
+                output += out
+        return output
+
+class VM(Machine):
+    def execute(self, command: str) -> Tuple[int, str]:
+        self.connect()
+
+        out_command = "( set -euo pipefail; {} ); echo '|!=EOF' $?\n".format(command)
+        assert self.shell
+        self.shell.send(out_command.encode())
+
+        output = ""
+        status_code_pattern = re.compile(r"(.*)\|\!=EOF\s+(\d+)")
+
+        while True:
+            chunk = self.shell.recv(4096).decode(errors="ignore")
+            match = status_code_pattern.match(chunk)
+            if match:
+                output += match[1]
+                status_code = int(match[2])
+                return (status_code, output)
+            output += chunk
+
+    def send_monitor_command(self, command: str) -> str:
+        message = ("{}\n".format(command)).encode()
+        self.log("sending monitor command: {}".format(command))
+        assert self.monitor is not None
+        self.monitor.send(message)
+        return self.wait_for_monitor_prompt()
+
+class MachineTester(ABC):
     """A handle to the machine with this name, that also knows how to manage
     the machine lifecycle with the help of a start script / command."""
 
@@ -445,6 +505,11 @@ class Machine:
             rootlog.info(f"    -> delete state @ {self.state_dir}")
         self.state_dir.mkdir(mode=0o700, exist_ok=True)
 
+    @property
+    @abstractmethod
+    def machine(self) -> Machine:
+        pass
+
     @staticmethod
     def create_startcommand(args: Dict[str, str]) -> StartCommand:
         rootlog.warning(
@@ -492,13 +557,6 @@ class Machine:
             if answer.endswith("(qemu) "):
                 break
         return answer
-
-    def send_monitor_command(self, command: str) -> str:
-        message = ("{}\n".format(command)).encode()
-        self.log("sending monitor command: {}".format(command))
-        assert self.monitor is not None
-        self.monitor.send(message)
-        return self.wait_for_monitor_prompt()
 
     def wait_for_unit(self, unit: str, user: Optional[str] = None) -> None:
         """Wait for a systemd unit to get into "active" state.
@@ -573,25 +631,6 @@ class Machine:
                     + "'{}' but it is in state ‘{}’".format(require_state, state)
                 )
 
-    def execute(self, command: str) -> Tuple[int, str]:
-        self.connect()
-
-        out_command = "( set -euo pipefail; {} ); echo '|!=EOF' $?\n".format(command)
-        assert self.shell
-        self.shell.send(out_command.encode())
-
-        output = ""
-        status_code_pattern = re.compile(r"(.*)\|\!=EOF\s+(\d+)")
-
-        while True:
-            chunk = self.shell.recv(4096).decode(errors="ignore")
-            match = status_code_pattern.match(chunk)
-            if match:
-                output += match[1]
-                status_code = int(match[2])
-                return (status_code, output)
-            output += chunk
-
     def shell_interact(self) -> None:
         """Allows you to interact with the guest shell
 
@@ -604,33 +643,6 @@ class Machine:
             ["socat", "READLINE", f"FD:{self.shell.fileno()}"],
             pass_fds=[self.shell.fileno()],
         )
-
-    def succeed(self, *commands: str) -> str:
-        """Execute each command and check that it succeeds."""
-        output = ""
-        for command in commands:
-            with self.nested("must succeed: {}".format(command)):
-                (status, out) = self.execute(command)
-                if status != 0:
-                    self.log("output: {}".format(out))
-                    raise Exception(
-                        "command `{}` failed (exit code {})".format(command, status)
-                    )
-                output += out
-        return output
-
-    def fail(self, *commands: str) -> str:
-        """Execute each command and check that it fails."""
-        output = ""
-        for command in commands:
-            with self.nested("must fail: {}".format(command)):
-                (status, out) = self.execute(command)
-                if status == 0:
-                    raise Exception(
-                        "command `{}` unexpectedly succeeded".format(command)
-                    )
-                output += out
-        return output
 
     def wait_until_succeeds(self, command: str, timeout: int = 900) -> str:
         """Wait until a command returns success and return its output.
@@ -756,23 +768,6 @@ class Machine:
             self.log("connected to guest root shell")
             self.log("(connecting took {:.2f} seconds)".format(toc - tic))
             self.connected = True
-
-    def screenshot(self, filename: str) -> None:
-        out_dir = os.environ.get("out", os.getcwd())
-        word_pattern = re.compile(r"^\w+$")
-        if word_pattern.match(filename):
-            filename = os.path.join(out_dir, "{}.png".format(filename))
-        tmp = "{}.ppm".format(filename)
-
-        with self.nested(
-            "making screenshot {}".format(filename),
-            {"image": os.path.basename(filename)},
-        ):
-            self.send_monitor_command("screendump {}".format(tmp))
-            ret = subprocess.run("pnmtopng {} > {}".format(tmp, filename), shell=True)
-            os.unlink(tmp)
-            if ret.returncode != 0:
-                raise Exception("Cannot convert screenshot")
 
     def copy_from_host_via_shell(self, source: str, target: str) -> None:
         """Copy a file from the host into the guest by piping it over the
@@ -1027,6 +1022,28 @@ class Machine:
         self.shell.close()
         self.monitor.close()
 
+class VMTester(MachineTester):
+    machine: VM
+
+    def __init__(self):
+        self.machine = VM()
+
+    def screenshot(self, filename: str) -> None:
+        out_dir = os.environ.get("out", os.getcwd())
+        word_pattern = re.compile(r"^\w+$")
+        if word_pattern.match(filename):
+            filename = os.path.join(out_dir, "{}.png".format(filename))
+        tmp = "{}.ppm".format(filename)
+
+        with self.nested(
+            "making screenshot {}".format(filename),
+            {"image": os.path.basename(filename)},
+        ):
+            self.machine.send_monitor_command("screendump {}".format(tmp))
+            ret = subprocess.run("pnmtopng {} > {}".format(tmp, filename), shell=True)
+            os.unlink(tmp)
+            if ret.returncode != 0:
+                raise Exception("Cannot convert screenshot")
 
 class VLan:
     """A handle to the vlan with this number, that also knows how to manage
