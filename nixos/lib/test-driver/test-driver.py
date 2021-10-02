@@ -392,38 +392,158 @@ class LegacyStartCommand(StartCommand):
 
 
 class Machine(ABC):
+    state_dir: pathlib.Path
+
+    def __init__(
+        self,
+        tmp_dir: pathlib.Path,
+        name: str = "machine",
+        keep_vm_state: bool = False
+    ) -> None:
+        self.name = name
+        self.keep_vm_state = keep_vm_state
+
+        self.state_dir = tmp_dir / f"machine-state-{self.name}"
+        if (not self.keep_vm_state) and self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+            rootlog.info(f"    -> delete state @ {self.state_dir}")
+        self.state_dir.mkdir(mode=0o700, exist_ok=True)
+
+    @abstractmethod
+    def start(self) -> None:
+        pass
+
+    @abstractmethod
+    def is_up(self) -> bool:
+        pass
+
+    @abstractmethod
+    def shutdown(self) -> None:
+        pass
+
+    @abstractmethod
+    def wait_for_shutdown(self) -> None:
+        pass
+
     @abstractmethod
     def execute(self, command: str) -> Tuple[int, str]:
         pass
 
-    def succeed(self, *commands: str) -> str:
-        """Execute each command and check that it succeeds."""
-        output = ""
-        for command in commands:
-            with self.nested("must succeed: {}".format(command)):
-                (status, out) = self.execute(command)
-                if status != 0:
-                    self.log("output: {}".format(out))
-                    raise Exception(
-                        "command `{}` failed (exit code {})".format(command, status)
-                    )
-                output += out
-        return output
+    @abstractmethod
+    def shell_interact(self) -> None:
+        pass
 
-    def fail(self, *commands: str) -> str:
-        """Execute each command and check that it fails."""
-        output = ""
-        for command in commands:
-            with self.nested("must fail: {}".format(command)):
-                (status, out) = self.execute(command)
-                if status == 0:
-                    raise Exception(
-                        "command `{}` unexpectedly succeeded".format(command)
-                    )
-                output += out
-        return output
 
 class VM(Machine):
+    start_command: StartCommand
+
+    shared_dir: pathlib.Path
+
+    monitor_path: pathlib.Path
+    shell_path: pathlib.Path
+
+    process: Optional[subprocess.Popen] = None
+    pid: Optional[int] = None
+    monitor: Optional[socket.socket] = None
+    shell: Optional[socket.socket] = None
+
+    booted: bool = False
+    connected: bool = False
+    # Store last serial console lines for use
+    # of wait_for_console_text
+    last_lines: Queue = Queue()
+
+    def __init__(
+        self,
+        tmp_dir: pathlib.Path,
+        start_command: StartCommand,
+        name: str = "machine",
+        keep_vm_state: bool = False,
+    ) -> None:
+        super().__init__(tmp_dir, name, keep_vm_state)
+
+        self.start_command = start_command
+
+        self.monitor_path = self.state_dir / "monitor"
+        self.shell_path = self.state_dir / "shell"
+
+        self.shared_dir = tmp_dir / "shared-xchg"
+        self.shared_dir.mkdir(mode=0o700, exist_ok=True)
+
+    def start(self) -> None:
+        if self.booted:
+            return
+
+        self.log("starting vm")
+
+        def clear(path: pathlib.Path) -> pathlib.Path:
+            if path.exists():
+                path.unlink()
+            return path
+
+        def create_socket(path: pathlib.Path) -> socket.socket:
+            s = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
+            s.bind(str(path))
+            s.listen(1)
+            return s
+
+        monitor_socket = create_socket(clear(self.monitor_path))
+        shell_socket = create_socket(clear(self.shell_path))
+        self.process = self.start_command.run(
+            self.state_dir,
+            self.shared_dir,
+            self.monitor_path,
+            self.shell_path,
+        )
+        self.monitor, _ = monitor_socket.accept()
+        self.shell, _ = shell_socket.accept()
+
+        # Store last serial console lines for use
+        # of wait_for_console_text
+        self.last_lines: Queue = Queue()
+
+        def process_serial_output() -> None:
+            assert self.process
+            assert self.process.stdout
+            for _line in self.process.stdout:
+                # Ignore undecodable bytes that may occur in boot menus
+                line = _line.decode(errors="ignore").replace("\r", "").rstrip()
+                self.last_lines.put(line)
+                self.log_serial(line)
+
+        _thread.start_new_thread(process_serial_output, ())
+
+        self.wait_for_monitor_prompt()
+
+        self.pid = self.process.pid
+        self.booted = True
+
+        self.log("QEMU running (pid {})".format(self.pid))
+
+    def is_up(self) -> bool:
+        return self.booted and self.connected
+
+    def shutdown(self) -> None:
+        if not self.booted:
+            return
+
+        assert self.shell
+        self.shell.send("poweroff\n".encode())
+        self.wait_for_shutdown()
+
+    def wait_for_shutdown(self) -> None:
+        if not self.booted:
+            return
+
+        with self.nested("waiting for the VM to power off"):
+            sys.stdout.flush()
+            assert self.process
+            self.process.wait()
+
+            self.pid = None
+            self.booted = False
+            self.connected = False
+
     def execute(self, command: str) -> Tuple[int, str]:
         self.connect()
 
@@ -443,6 +563,37 @@ class VM(Machine):
                 return (status_code, output)
             output += chunk
 
+    def shell_interact(self) -> None:
+        """Allows you to interact with the guest shell
+
+        Should only be used during test development, not in the production test."""
+        self.connect()
+        self.log("Terminal is ready (there is no prompt):")
+
+        assert self.shell
+        subprocess.run(
+            ["socat", "READLINE", f"FD:{self.shell.fileno()}"],
+            pass_fds=[self.shell.fileno()],
+        )
+
+    def connect(self) -> None:
+        if self.connected:
+            return
+
+        with self.nested("waiting for the VM to finish booting"):
+            self.start()
+
+            assert self.shell
+
+            tic = time.time()
+            self.shell.recv(1024)
+            # TODO: Timeout
+            toc = time.time()
+
+            self.log("connected to guest root shell")
+            self.log("(connecting took {:.2f} seconds)".format(toc - tic))
+            self.connected = True
+
     def send_monitor_command(self, command: str) -> str:
         message = ("{}\n".format(command)).encode()
         self.log("sending monitor command: {}".format(command))
@@ -450,60 +601,29 @@ class VM(Machine):
         self.monitor.send(message)
         return self.wait_for_monitor_prompt()
 
+    def wait_for_monitor_prompt(self) -> str:
+        assert self.monitor is not None
+        answer = ""
+        while True:
+            undecoded_answer = self.monitor.recv(1024)
+            if not undecoded_answer:
+                break
+            answer += undecoded_answer.decode()
+            if answer.endswith("(qemu) "):
+                break
+        return answer
+
 class MachineTester(ABC):
     """A handle to the machine with this name, that also knows how to manage
     the machine lifecycle with the help of a start script / command."""
 
     name: str
-    tmp_dir: pathlib.Path
-    shared_dir: pathlib.Path
-    state_dir: pathlib.Path
-    monitor_path: pathlib.Path
-    shell_path: pathlib.Path
 
-    start_command: StartCommand
     keep_vm_state: bool
-    allow_reboot: bool
 
-    process: Optional[subprocess.Popen] = None
-    pid: Optional[int] = None
-    monitor: Optional[socket.socket] = None
-    shell: Optional[socket.socket] = None
-
-    booted: bool = False
-    connected: bool = False
-    # Store last serial console lines for use
-    # of wait_for_console_text
-    last_lines: Queue = Queue()
 
     def __repr__(self) -> str:
         return f"<Machine '{self.name}'>"
-
-    def __init__(
-        self,
-        tmp_dir: pathlib.Path,
-        start_command: StartCommand,
-        name: str = "machine",
-        keep_vm_state: bool = False,
-        allow_reboot: bool = False,
-    ) -> None:
-        self.tmp_dir = tmp_dir
-        self.keep_vm_state = keep_vm_state
-        self.allow_reboot = allow_reboot
-        self.name = name
-        self.start_command = start_command
-
-        # set up directories
-        self.shared_dir = self.tmp_dir / "shared-xchg"
-        self.shared_dir.mkdir(mode=0o700, exist_ok=True)
-
-        self.state_dir = self.tmp_dir / f"vm-state-{self.name}"
-        self.monitor_path = self.state_dir / "monitor"
-        self.shell_path = self.state_dir / "shell"
-        if (not self.keep_vm_state) and self.state_dir.exists():
-            shutil.rmtree(self.state_dir)
-            rootlog.info(f"    -> delete state @ {self.state_dir}")
-        self.state_dir.mkdir(mode=0o700, exist_ok=True)
 
     @property
     @abstractmethod
@@ -532,9 +652,6 @@ class MachineTester(ABC):
             qemuFlags=args.get("qemuFlags"),
         )
 
-    def is_up(self) -> bool:
-        return self.booted and self.connected
-
     def log(self, msg: str) -> None:
         rootlog.log(msg, {"machine": self.name})
 
@@ -545,18 +662,6 @@ class MachineTester(ABC):
         my_attrs = {"machine": self.name}
         my_attrs.update(attrs)
         return rootlog.nested(msg, my_attrs)
-
-    def wait_for_monitor_prompt(self) -> str:
-        assert self.monitor is not None
-        answer = ""
-        while True:
-            undecoded_answer = self.monitor.recv(1024)
-            if not undecoded_answer:
-                break
-            answer += undecoded_answer.decode()
-            if answer.endswith("(qemu) "):
-                break
-        return answer
 
     def wait_for_unit(self, unit: str, user: Optional[str] = None) -> None:
         """Wait for a systemd unit to get into "active" state.
@@ -631,18 +736,32 @@ class MachineTester(ABC):
                     + "'{}' but it is in state ‘{}’".format(require_state, state)
                 )
 
-    def shell_interact(self) -> None:
-        """Allows you to interact with the guest shell
+    def succeed(self, *commands: str) -> str:
+        """Execute each command and check that it succeeds."""
+        output = ""
+        for command in commands:
+            with self.nested("must succeed: {}".format(command)):
+                (status, out) = self.execute(command)
+                if status != 0:
+                    self.log("output: {}".format(out))
+                    raise Exception(
+                        "command `{}` failed (exit code {})".format(command, status)
+                    )
+                output += out
+        return output
 
-        Should only be used during test development, not in the production test."""
-        self.connect()
-        self.log("Terminal is ready (there is no prompt):")
-
-        assert self.shell
-        subprocess.run(
-            ["socat", "READLINE", f"FD:{self.shell.fileno()}"],
-            pass_fds=[self.shell.fileno()],
-        )
+    def fail(self, *commands: str) -> str:
+        """Execute each command and check that it fails."""
+        output = ""
+        for command in commands:
+            with self.nested("must fail: {}".format(command)):
+                (status, out) = self.execute(command)
+                if status == 0:
+                    raise Exception(
+                        "command `{}` unexpectedly succeeded".format(command)
+                    )
+                output += out
+        return output
 
     def wait_until_succeeds(self, command: str, timeout: int = 900) -> str:
         """Wait until a command returns success and return its output.
@@ -673,19 +792,6 @@ class MachineTester(ABC):
         with self.nested("waiting for failure: {}".format(command)):
             retry(check_failure)
             return output
-
-    def wait_for_shutdown(self) -> None:
-        if not self.booted:
-            return
-
-        with self.nested("waiting for the VM to power off"):
-            sys.stdout.flush()
-            assert self.process
-            self.process.wait()
-
-            self.pid = None
-            self.booted = False
-            self.connected = False
 
     def get_tty_text(self, tty: str) -> str:
         status, output = self.execute(
@@ -750,24 +856,6 @@ class MachineTester(ABC):
 
     def wait_for_job(self, jobname: str) -> None:
         self.wait_for_unit(jobname)
-
-    def connect(self) -> None:
-        if self.connected:
-            return
-
-        with self.nested("waiting for the VM to finish booting"):
-            self.start()
-
-            assert self.shell
-
-            tic = time.time()
-            self.shell.recv(1024)
-            # TODO: Timeout
-            toc = time.time()
-
-            self.log("connected to guest root shell")
-            self.log("(connecting took {:.2f} seconds)".format(toc - tic))
-            self.connected = True
 
     def copy_from_host_via_shell(self, source: str, target: str) -> None:
         """Copy a file from the host into the guest by piping it over the
@@ -876,69 +964,11 @@ class MachineTester(ABC):
         key = CHAR_TO_KEY.get(key, key)
         self.send_monitor_command("sendkey {}".format(key))
 
-    def start(self) -> None:
-        if self.booted:
-            return
-
-        self.log("starting vm")
-
-        def clear(path: pathlib.Path) -> pathlib.Path:
-            if path.exists():
-                path.unlink()
-            return path
-
-        def create_socket(path: pathlib.Path) -> socket.socket:
-            s = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
-            s.bind(str(path))
-            s.listen(1)
-            return s
-
-        monitor_socket = create_socket(clear(self.monitor_path))
-        shell_socket = create_socket(clear(self.shell_path))
-        self.process = self.start_command.run(
-            self.state_dir,
-            self.shared_dir,
-            self.monitor_path,
-            self.shell_path,
-        )
-        self.monitor, _ = monitor_socket.accept()
-        self.shell, _ = shell_socket.accept()
-
-        # Store last serial console lines for use
-        # of wait_for_console_text
-        self.last_lines: Queue = Queue()
-
-        def process_serial_output() -> None:
-            assert self.process
-            assert self.process.stdout
-            for _line in self.process.stdout:
-                # Ignore undecodable bytes that may occur in boot menus
-                line = _line.decode(errors="ignore").replace("\r", "").rstrip()
-                self.last_lines.put(line)
-                self.log_serial(line)
-
-        _thread.start_new_thread(process_serial_output, ())
-
-        self.wait_for_monitor_prompt()
-
-        self.pid = self.process.pid
-        self.booted = True
-
-        self.log("QEMU running (pid {})".format(self.pid))
-
     def cleanup_statedir(self) -> None:
         if os.path.isdir(self.state_dir):
             shutil.rmtree(self.state_dir)
             rootlog.log(f"deleting VM state directory {self.state_dir}")
             rootlog.log("if you want to keep the VM state, pass --keep-vm-state")
-
-    def shutdown(self) -> None:
-        if not self.booted:
-            return
-
-        assert self.shell
-        self.shell.send("poweroff\n".encode())
-        self.wait_for_shutdown()
 
     def crash(self) -> None:
         if not self.booted:
@@ -1025,8 +1055,14 @@ class MachineTester(ABC):
 class VMTester(MachineTester):
     machine: VM
 
-    def __init__(self):
-        self.machine = VM()
+    def __init__(
+        self,
+        tmp_dir: pathlib.Path,
+        start_command: StartCommand,
+        name: str = "machine",
+        keep_vm_state: bool = False,
+    ) -> None:
+        self.machine = VM(tmp_dir, start_command, name, keep_vm_state)
 
     def screenshot(self, filename: str) -> None:
         out_dir = os.environ.get("out", os.getcwd())
