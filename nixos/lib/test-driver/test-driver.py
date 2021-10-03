@@ -392,6 +392,8 @@ class LegacyStartCommand(StartCommand):
 
 
 class Machine(ABC):
+    name: str
+    keep_vm_state: bool
     state_dir: pathlib.Path
 
     def __init__(
@@ -408,6 +410,10 @@ class Machine(ABC):
             shutil.rmtree(self.state_dir)
             rootlog.info(f"    -> delete state @ {self.state_dir}")
         self.state_dir.mkdir(mode=0o700, exist_ok=True)
+
+    @abstractmethod
+    def __repr__(self) -> str:
+        pass
 
     @abstractmethod
     def start(self) -> None:
@@ -433,6 +439,13 @@ class Machine(ABC):
     def shell_interact(self) -> None:
         pass
 
+    @abstractmethod
+    def copy_from_host(self, source: str, target: str) -> None:
+        pass
+
+    @abstractmethod
+    def copy_from_machine(self, source: str, target_dir: str = "") -> None:
+        pass
 
 class VM(Machine):
     start_command: StartCommand
@@ -576,6 +589,50 @@ class VM(Machine):
             pass_fds=[self.shell.fileno()],
         )
 
+    def copy_from_host(self, source: str, target: str) -> None:
+        """Copy a file from the host into the guest via the `shared_dir` shared
+        among all the VMs (using a temporary directory).
+        """
+        host_src = pathlib.Path(source)
+        vm_target = pathlib.Path(target)
+        with tempfile.TemporaryDirectory(dir=self.shared_dir) as shared_td:
+            shared_temp = pathlib.Path(shared_td)
+            host_intermediate = shared_temp / host_src.name
+            vm_shared_temp = pathlib.Path("/tmp/shared") / shared_temp.name
+            vm_intermediate = vm_shared_temp / host_src.name
+
+            self.succeed(make_command(["mkdir", "-p", vm_shared_temp]))
+            if host_src.is_dir():
+                shutil.copytree(host_src, host_intermediate)
+            else:
+                shutil.copy(host_src, host_intermediate)
+            self.succeed(make_command(["mkdir", "-p", vm_target.parent]))
+            self.succeed(make_command(["cp", "-r", vm_intermediate, vm_target]))
+
+    def copy_from_vm(self, source: str, target_dir: str = "") -> None:
+        """Copy a file from the VM (specified by an in-VM source path) to a path
+        relative to `$out`. The file is copied via the `shared_dir` shared among
+        all the VMs (using a temporary directory).
+        """
+        # Compute the source, target, and intermediate shared file names
+        out_dir = pathlib.Path(os.environ.get("out", os.getcwd()))
+        vm_src = pathlib.Path(source)
+        with tempfile.TemporaryDirectory(dir=self.shared_dir) as shared_td:
+            shared_temp = pathlib.Path(shared_td)
+            vm_shared_temp = pathlib.Path("/tmp/shared") / shared_temp.name
+            vm_intermediate = vm_shared_temp / vm_src.name
+            intermediate = shared_temp / vm_src.name
+            # Copy the file to the shared directory inside VM
+            self.succeed(make_command(["mkdir", "-p", vm_shared_temp]))
+            self.succeed(make_command(["cp", "-r", vm_src, vm_intermediate]))
+            abs_target = out_dir / target_dir / vm_src.name
+            abs_target.parent.mkdir(exist_ok=True, parents=True)
+            # Copy the file from the shared directory outside VM
+            if intermediate.is_dir():
+                shutil.copytree(intermediate, abs_target)
+            else:
+                shutil.copy(intermediate, abs_target)
+
     def connect(self) -> None:
         if self.connected:
             return
@@ -617,14 +674,6 @@ class MachineTester(ABC):
     """A handle to the machine with this name, that also knows how to manage
     the machine lifecycle with the help of a start script / command."""
 
-    name: str
-
-    keep_vm_state: bool
-
-
-    def __repr__(self) -> str:
-        return f"<Machine '{self.name}'>"
-
     @property
     @abstractmethod
     def machine(self) -> Machine:
@@ -653,13 +702,13 @@ class MachineTester(ABC):
         )
 
     def log(self, msg: str) -> None:
-        rootlog.log(msg, {"machine": self.name})
+        rootlog.log(msg, {"machine": self.machine.name})
 
     def log_serial(self, msg: str) -> None:
         rootlog.log_serial(msg, self.name)
 
     def nested(self, msg: str, attrs: Dict[str, str] = {}) -> _GeneratorContextManager:
-        my_attrs = {"machine": self.name}
+        my_attrs = {"machine": self.machine.name}
         my_attrs.update(attrs)
         return rootlog.nested(msg, my_attrs)
 
@@ -715,14 +764,14 @@ class MachineTester(ABC):
     def systemctl(self, q: str, user: Optional[str] = None) -> Tuple[int, str]:
         if user is not None:
             q = q.replace("'", "\\'")
-            return self.execute(
+            return self.machine.execute(
                 (
                     "su -l {} --shell /bin/sh -c "
                     "$'XDG_RUNTIME_DIR=/run/user/`id -u` "
                     "systemctl --user {}'"
                 ).format(user, q)
             )
-        return self.execute("systemctl {}".format(q))
+        return self.machine.execute("systemctl {}".format(q))
 
     def require_unit_state(self, unit: str, require_state: str = "active") -> None:
         with self.nested(
@@ -741,7 +790,7 @@ class MachineTester(ABC):
         output = ""
         for command in commands:
             with self.nested("must succeed: {}".format(command)):
-                (status, out) = self.execute(command)
+                (status, out) = self.machine.execute(command)
                 if status != 0:
                     self.log("output: {}".format(out))
                     raise Exception(
@@ -755,7 +804,7 @@ class MachineTester(ABC):
         output = ""
         for command in commands:
             with self.nested("must fail: {}".format(command)):
-                (status, out) = self.execute(command)
+                (status, out) = self.machine.execute(command)
                 if status == 0:
                     raise Exception(
                         "command `{}` unexpectedly succeeded".format(command)
@@ -771,7 +820,7 @@ class MachineTester(ABC):
 
         def check_success(_: Any) -> bool:
             nonlocal output
-            status, output = self.execute(command)
+            status, output = self.machine.execute(command)
             return status == 0
 
         with self.nested("waiting for success: {}".format(command)):
@@ -786,7 +835,7 @@ class MachineTester(ABC):
 
         def check_failure(_: Any) -> bool:
             nonlocal output
-            status, output = self.execute(command)
+            status, output = self.machine.execute(command)
             return status != 0
 
         with self.nested("waiting for failure: {}".format(command)):
@@ -794,7 +843,7 @@ class MachineTester(ABC):
             return output
 
     def get_tty_text(self, tty: str) -> str:
-        status, output = self.execute(
+        status, output = self.machine.execute(
             "fold -w$(stty -F /dev/tty{0} size | "
             "awk '{{print $2}}') /dev/vcs{0}".format(tty)
         )
@@ -818,16 +867,11 @@ class MachineTester(ABC):
         with self.nested("waiting for {} to appear on tty {}".format(regexp, tty)):
             retry(tty_matches)
 
-    def send_chars(self, chars: List[str]) -> None:
-        with self.nested("sending keys ‘{}‘".format(chars)):
-            for char in chars:
-                self.send_key(char)
-
     def wait_for_file(self, filename: str) -> None:
         """Waits until the file exists in machine's file system."""
 
         def check_file(_: Any) -> bool:
-            status, _ = self.execute("test -e {}".format(filename))
+            status, _ = self.machine.execute("test -e {}".format(filename))
             return status == 0
 
         with self.nested("waiting for file ‘{}‘".format(filename)):
@@ -835,7 +879,7 @@ class MachineTester(ABC):
 
     def wait_for_open_port(self, port: int) -> None:
         def port_is_open(_: Any) -> bool:
-            status, _ = self.execute("nc -z localhost {}".format(port))
+            status, _ = self.machine.execute("nc -z localhost {}".format(port))
             return status == 0
 
         with self.nested("waiting for TCP port {}".format(port)):
@@ -843,7 +887,7 @@ class MachineTester(ABC):
 
     def wait_for_closed_port(self, port: int) -> None:
         def port_is_closed(_: Any) -> bool:
-            status, _ = self.execute("nc -z localhost {}".format(port))
+            status, _ = self.machine.execute("nc -z localhost {}".format(port))
             return status != 0
 
         retry(port_is_closed)
@@ -868,50 +912,6 @@ class MachineTester(ABC):
                 f"mkdir -p $(dirname {target})",
                 f"echo -n {content_b64} | base64 -d > {target}",
             )
-
-    def copy_from_host(self, source: str, target: str) -> None:
-        """Copy a file from the host into the guest via the `shared_dir` shared
-        among all the VMs (using a temporary directory).
-        """
-        host_src = pathlib.Path(source)
-        vm_target = pathlib.Path(target)
-        with tempfile.TemporaryDirectory(dir=self.shared_dir) as shared_td:
-            shared_temp = pathlib.Path(shared_td)
-            host_intermediate = shared_temp / host_src.name
-            vm_shared_temp = pathlib.Path("/tmp/shared") / shared_temp.name
-            vm_intermediate = vm_shared_temp / host_src.name
-
-            self.succeed(make_command(["mkdir", "-p", vm_shared_temp]))
-            if host_src.is_dir():
-                shutil.copytree(host_src, host_intermediate)
-            else:
-                shutil.copy(host_src, host_intermediate)
-            self.succeed(make_command(["mkdir", "-p", vm_target.parent]))
-            self.succeed(make_command(["cp", "-r", vm_intermediate, vm_target]))
-
-    def copy_from_vm(self, source: str, target_dir: str = "") -> None:
-        """Copy a file from the VM (specified by an in-VM source path) to a path
-        relative to `$out`. The file is copied via the `shared_dir` shared among
-        all the VMs (using a temporary directory).
-        """
-        # Compute the source, target, and intermediate shared file names
-        out_dir = pathlib.Path(os.environ.get("out", os.getcwd()))
-        vm_src = pathlib.Path(source)
-        with tempfile.TemporaryDirectory(dir=self.shared_dir) as shared_td:
-            shared_temp = pathlib.Path(shared_td)
-            vm_shared_temp = pathlib.Path("/tmp/shared") / shared_temp.name
-            vm_intermediate = vm_shared_temp / vm_src.name
-            intermediate = shared_temp / vm_src.name
-            # Copy the file to the shared directory inside VM
-            self.succeed(make_command(["mkdir", "-p", vm_shared_temp]))
-            self.succeed(make_command(["cp", "-r", vm_src, vm_intermediate]))
-            abs_target = out_dir / target_dir / vm_src.name
-            abs_target.parent.mkdir(exist_ok=True, parents=True)
-            # Copy the file from the shared directory outside VM
-            if intermediate.is_dir():
-                shutil.copytree(intermediate, abs_target)
-            else:
-                shutil.copy(intermediate, abs_target)
 
     def dump_tty_contents(self, tty: str) -> None:
         """Debugging: Dump the contents of the TTY<n>"""
@@ -963,6 +963,11 @@ class MachineTester(ABC):
     def send_key(self, key: str) -> None:
         key = CHAR_TO_KEY.get(key, key)
         self.send_monitor_command("sendkey {}".format(key))
+
+    def send_chars(self, chars: List[str]) -> None:
+        with self.nested("sending keys ‘{}‘".format(chars)):
+            for char in chars:
+                self.send_key(char)
 
     def cleanup_statedir(self) -> None:
         if os.path.isdir(self.state_dir):
@@ -1054,6 +1059,9 @@ class MachineTester(ABC):
 
 class VMTester(MachineTester):
     machine: VM
+
+    def __repr__(self) -> str:
+        return f"<VM '{self.name}'>"
 
     def __init__(
         self,
