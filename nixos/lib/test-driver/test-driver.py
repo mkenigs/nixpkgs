@@ -447,7 +447,7 @@ class Machine(ABC):
     def copy_from_machine(self, source: str, target_dir: str = "") -> None:
         pass
 
-class VM(Machine):
+class VM(Machine, PublicVM):
     start_command: StartCommand
 
     shared_dir: pathlib.Path
