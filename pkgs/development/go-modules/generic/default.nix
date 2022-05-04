@@ -146,14 +146,13 @@ let
     inherit (go) GOOS GOARCH;
 
     GO111MODULE = "on";
-    GOFLAGS = lib.optionals (!proxyVendor) [ "-mod=vendor" ] ++ lib.optionals (!allowGoReference) [ "-trimpath" ];
+    GOFLAGS = lib.optionals (!allowGoReference) [ "-trimpath" ];
 
     configurePhase = args.configurePhase or ''
       runHook preConfigure
 
       export GOCACHE=$TMPDIR/go-cache
       export GOPATH="$TMPDIR/go"
-      export GOPROXY=off
       export GOSUMDB=off
       cd "$modRoot"
     '' + lib.optionalString (vendorSha256 != null) ''
