@@ -8,7 +8,7 @@
   pkg-config,
   libiconv,
   darwin,
-  protobuf
+  protobuf,
 }:
 rustPlatform.buildRustPackage rec {
   pname = "nostr-rs-relay";
@@ -31,6 +31,7 @@ rustPlatform.buildRustPackage rec {
     ++ lib.optional stdenv.isDarwin [
       libiconv
       darwin.apple_sdk.frameworks.Security
+      darwin.apple_sdk.frameworks.SystemConfiguration
     ]
     ++ lib.optional stdenv.isLinux [];
 
