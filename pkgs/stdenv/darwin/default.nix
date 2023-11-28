@@ -1366,7 +1366,7 @@ in
             CF ICU Libsystem darwin-stubs dyld locale libobjc libtapi rewrite-tbd xnu;
         } // lib.optionalAttrs (super.stdenv.targetPlatform == localSystem) {
           inherit (prevStage.darwin) binutils binutils-unwrapped cctools-llvm cctools-port;
-        });
+        }) // { recurseForDerivations = true; };
       } // lib.optionalAttrs (super.stdenv.targetPlatform == localSystem) {
         inherit (prevStage.llvmPackages) clang llvm;
 
